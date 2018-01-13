@@ -1,0 +1,175 @@
+---
+title: "SPRINT invalid instrument simulation"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    keep_tex: yes
+---
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(timereg)
+set.seed(32343)
+```
+
+```{r}
+baseline <- read_csv(file = "~/phd/sfg/nejm-sprint/data/baseline.csv") %>%
+  mutate(SMOKER=SMOKE_3CAT >= 2 & SMOKE_3CAT <= 4)
+outcomes <- read_csv(file = "~/phd/sfg/nejm-sprint/data/outcomes.csv")
+bp <- read_csv(file = "~/phd/sfg/nejm-sprint/data/bp.csv") %>%
+  mutate(VISITTIME = ifelse(VISITCODE=="RZ", 0, strtoi(substr(VISITCODE, 1, nchar(VISITCODE)-1)))) %>%
+  arrange(MASKID, desc(VISITTIME)) %>%
+  group_by(MASKID) %>%
+  filter(row_number()==1) %>%
+  ungroup()
+data <- inner_join(x=baseline, y=bp, by="MASKID")
+data <- inner_join(x=data, y=outcomes, by="MASKID")
+```
+
+First, let's see what an Aalen additive hazard model's coefficients would look like on the true outcomes.
+```{r}
+model_if_just_sbp <- aareg(
+  Surv(T_PRIMARY, EVENT_PRIMARY) ~ SBP.y + AGE +
+    SMOKER + SCREAT + STATIN + HDL,
+  data=data)
+plot(model_if_just_sbp)
+```
+```{r}
+coefs <- summary(model_if_just_sbp, maxtime=1100)$table[,"slope"]
+coefs <- split(coefs, names(coefs))
+```
+
+Their methods section says they adjusted for
+
+> age, sex, race, body mass index (BMI), smoking,
+> high density lipoprotein (HDL), serum creatinine,
+> use of statin drugs, history of cardiovascular disease,
+> and history of chronic kidney disease
+
+Their full methods for CVD risk:
+
+> We estimated a recently validated two-stage additive hazards model to examine the incremental
+effect of antihypertensive drugs on major cardiovascular events and serious adverse events. In the
+first stage, we estimated the predicted number of antihypertensive drug classes as a linear function of
+randomization status and covariates. In the second stage, we estimated cardiovascular or adverse
+risk as a function of the predicted number of antihypertensive drug classes (from the first stage) and
+covariates. We estimated Aalen additive hazards models in the second stage to account for the rightcensored
+nature of survival outcomes. To account for the combined statistical uncertainty of the two
+stages, we implemented a bootstrap estimator and based statistical inference on 95% confidence
+intervals derived from 2000 nonparametric bootstraps.
+
+>  We estimated fully non-parametric additive hazards
+models and based parameter estimates on the weighted linear regression of the cumulative estimates
+plot. We did so to provide a useful measure of the overall size of the effect. 
+
+Let's give it a try, first using the true event data:
+```{r}
+first_stage <- lm(
+  N_BPCLASSES ~ INTENSIVE + AGE +
+    FEMALE + BMI + SMOKE_3CAT + SCREAT +
+    STATIN + SUB_CKD + SUB_CVD + HDL,
+  data = data)
+
+second_stage_data <- data %>%
+  mutate(predicted_classes = predict(first_stage, data))
+
+second_stage <- aareg(
+  Surv(T_PRIMARY / 365.25, EVENT_PRIMARY) ~ predicted_classes +
+  AGE + FEMALE + BMI + SMOKER + SCREAT + STATIN + SUB_CKD + SUB_CVD + HDL,
+  data = second_stage_data)
+
+summary(second_stage, maxtime = 4e8)$table["predicted_classes", "slope"] * 1000
+```
+This effect size is similar to what is reported in the paper. It's not clear from the documentation why one should use the slope instead of the coef, but it is consistent with what they do in [their analysis](https://github.com/adammarkovitz/sprint/blob/master/effects_cardiovascular_adverse_event_risk).
+
+Next, let's consider what happens if we simulate event times, according to the additive hazards model that we built using the real data. We will adjust the coefficients a little bit, to deal with overfitting, so that the simulation matches the data more closely in terms of its SBP dependence.
+
+Print the coefficients to include in our response:
+```{r}
+coefs$Intercept- 0.1 * coefs$SBP.y * 130
+1.1 * coefs$SBP.y
+coefs$AGE
+coefs$SMOKERTRUE
+coefs$SCREAT
+coefs$STATIN
+coefs$HDL
+```
+
+Now, simulate the outcome, and confirm that the coefficients of the model refit to this data are similar to what was fit to the original SPRINT data, to make sure our correction for finite sample bias was appropriate.
+```{r}
+simulate_outcome_time <- function(X) {
+  n <- nrow(X)
+  # pmax prevents negative hazards, which in the simulation
+  # could happen due to chance. Obviously a hazard cannot be
+  # negative, in reality.
+  h <- pmax(coefs$Intercept - 0.1 * coefs$SBP.y * 130 +
+              1.1 * X$SBP.y * coefs$SBP.y + X$AGE * coefs$AGE +
+              X$SMOKER * coefs$SMOKERTRUE + X$SCREAT * coefs$SCREAT +
+              X$STATIN * coefs$STATIN + X$HDL * coefs$HDL,
+            1/(60*365.25))
+  v <- runif(n)
+  H <- - log(v)
+  t <- H / h
+  return(t)
+}
+
+second_stage_data <- second_stage_data %>%
+  mutate(survival.time=simulate_outcome_time(.))
+
+model_if_just_sbp_check <- aareg(
+  Surv(survival.time) ~ SBP.y + AGE +
+    SMOKER + SCREAT + STATIN + HDL,
+  data=second_stage_data)
+
+summary(model_if_just_sbp, maxtime = 8e4)$table[,"coef"]
+summary(model_if_just_sbp_check, maxtime = 8e4)$table[,"coef"]
+plot(model_if_just_sbp_check)
+```
+Due to random variation and potential model mis-specification, the simulated data set has higher impact of SBP on the outcome, which is why the coefficient has been inflated slightly.
+
+What happens to the 2 stage least squares analysis when we use our simulated event times, which we know have nothing to do with the number of BP classes used, and only has to do with the SBP after 1 year.
+```{r}
+second_stage <- survival::aareg(
+  Surv(survival.time/365.25) ~ predicted_classes +
+    AGE + FEMALE + BMI + SMOKER + SCREAT + STATIN +
+    SUB_CKD + SUB_CVD + HDL,
+  data = second_stage_data)
+
+summary(second_stage, maxtime=4e8)$table["predicted_classes","slope"] * 1000
+```
+This is of a similar order of magnitude, and -6.67 versus -5.22 could be a matter of how well the relationship between SBP and outcome in the simulation matches the real outcomes in the SPRINT trial. Of course, this does not show that having multiple classes of drugs has no effect-- to be sure, if lower SBP is achieved using multiple drugs, then this result is consistent with that being the case. However, it suggests that the IV is not meaningful in disentangling whether multiple classes of drugs is better than a single drug at a higher dosage.
+
+Just to be sure, let's check CIs with a nonparametric bootstrap.
+```{r}
+library(boot)
+boot_fn <- function(formula, data, indices) {
+  data <- data[indices, ]
+  stage1 <- lm(N_BPCLASSES ~ INTENSIVE + AGE +
+                 FEMALE + BMI + SMOKE_3CAT + SCREAT +
+                 STATIN + SUB_CKD + SUB_CVD + HDL,
+               data = data)
+  stage2_data <- data
+  stage2_data$predicted_classes <- predict(first_stage, data)
+  stage2 <- survival::aareg(formula, data=stage2_data)
+  return(summary(stage2, maxtime=4e8)$table["predicted_classes","slope"] * 1000)
+}
+
+boot_obj <- boot(
+  second_stage_data,
+  boot_fn,
+  # matches the number of available cores I had to
+  # run this in a reasonable amount of time.
+  21,
+  formula = formula(
+    Surv(survival.time/365.25) ~ predicted_classes +
+      AGE + FEMALE + BMI + SMOKE_3CAT + SCREAT + STATIN +
+      SUB_CKD + SUB_CVD + HDL),
+  parallel = "multicore",
+  ncpus=3)
+
+boot.ci(boot_obj, type="norm")
+```
+This is significant, suggesting that one can get significant P-values to reject the null, even under the null, due to the fact that the IV is invalid.
